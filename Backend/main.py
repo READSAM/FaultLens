@@ -435,7 +435,7 @@ def extract_metrics(
         description=(
             "Required for C/C++: SourceMeter analyzes the code by watching this build, so it "
             "must compile AND link something (executable or library) and exit with 0. "
-            "Write it as one line joined with && (e.g. 'mkdir -p build && cd build && cmake .. && make'), (make clean || True && make) "
+            "Write it as one line joined with && (e.g. 'rm -rf build && mkdir build && cd build && cmake -DCMAKE_CXX_COMPILER=g++ .. && make'), (make clean || True && make) "
             "or as several lines. A #!/bin/bash line and 'set -e' are added automatically. "
             "Ignored for Java."
         ),
