@@ -4,3 +4,7 @@
 /Backend/test-repo
 /Backend/testing
 /Backend/SourceMeter-10.2.0-x64-Linux.tgz
+/Frontend/node_modules
+/Frontend/dist
+/Frontend/dist-single
+/Frontend/.env

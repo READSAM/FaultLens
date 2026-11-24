@@ -1,3 +1,4 @@
+import csv
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ from enum import Enum
 
 import docker
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from requests.exceptions import ConnectionError as ReqConnectionError
 from requests.exceptions import ReadTimeout
@@ -20,6 +22,16 @@ from starlette.background import BackgroundTask
 log = logging.getLogger("sfp")
 
 app = FastAPI(title="SFP Universal Metric Extraction Platform")
+
+# Lets the React frontend (Frontend/, Vite dev server on :5173) call this API from the browser.
+# Set CORS_ORIGINS to a comma-separated list of your deployed frontend URLs.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
 client = docker.from_env()
 
 # --------------------------------------------------------------------------
@@ -320,6 +332,40 @@ def build_hard_filter(filter_paths):
     return "\n".join(lines) + "\n"
 
 
+def split_filter_paths(filter_paths):
+    """'tests, third_party/lib' -> ['tests', 'third_party/lib'] (same cleanup as build_hard_filter)."""
+    out = []
+    for p in filter_paths.split(","):
+        p = p.strip().replace("\\", "/").strip("/")
+        if p.startswith("./"):
+            p = p[2:]
+        if not p:
+            continue
+        if any(c in p for c in "\r\n\0") or ".." in p.split("/"):
+            raise HTTPException(status_code=400, detail=f"Invalid filter path: {p!r}")
+        out.append(p)
+    return out
+
+
+def filter_csv_rows(csv_path, filter_paths):
+    """Java: AnalyzerJava has no hard-filter option, so drop the result rows whose Path
+    lies inside an excluded folder (segment match, like the C/C++ filter). Returns rows removed."""
+    pats = [re.compile(r"(^|/)" + re.escape(p) + r"(/|$)") for p in split_filter_paths(filter_paths)]
+    if not pats:
+        return 0
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fields, rows = reader.fieldnames, list(reader)
+    if not fields or "Path" not in fields:
+        return 0
+    keep = [r for r in rows if not any(p.search((r.get("Path") or "").replace("\\", "/")) for p in pats)]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, quoting=csv.QUOTE_ALL)
+        w.writeheader()
+        w.writerows(keep)
+    return len(rows) - len(keep)
+
+
 def flatten_nested_directory(base_dir):
     """
     If the archive holds a single top-level folder (ignoring __MACOSX and
@@ -441,7 +487,7 @@ def extract_metrics(
         ),
         examples=[BUILD_CMDS_EXAMPLE],
     ),
-    filter_paths: str = Form(""),        # C/C++ only: kept in the build, left out of the analysis
+    filter_paths: str = Form(""),        # C/C++: kept in the build, left out of the analysis. Java: matching rows are removed from the CSV
 ):
     filename = os.path.basename(file.filename or "")
     if not filename.lower().endswith(ARCHIVE_EXTS):
@@ -449,8 +495,6 @@ def extract_metrics(
 
     lang_key = "cpp" if language is Language.c else language.value  # C uses the C++ analyzer
     granularities = GRANULARITY_BY_LANGUAGE.get(lang_key, DEFAULT_GRANULARITY)
-    if filter_paths.strip() and lang_key != "cpp":
-        raise HTTPException(status_code=400, detail="filter_paths is only supported for C/C++.")
     if lang_key == "cpp" and not build_cmds.strip():
         raise HTTPException(
             status_code=400,
@@ -482,7 +526,7 @@ def extract_metrics(
         if build_cmds.strip():
             with open(os.path.join(src_dir, "build.sh"), "w", newline="\n", encoding="utf-8") as f:
                 f.write(normalize_build_cmds(build_cmds))
-        if filter_paths.strip():
+        if filter_paths.strip() and lang_key == "cpp":
             with open(os.path.join(src_dir, FILTER_FILENAME), "w", newline="\n", encoding="utf-8") as f:
                 f.write(build_hard_filter(filter_paths))
 
@@ -499,6 +543,10 @@ def extract_metrics(
                 status_code=500,
                 detail=f"Analysis completed, but no CSVs for granularities {granularities} were found. Logs:\n{trim_logs(logs)}",
             )
+
+        if filter_paths.strip() and lang_key != "cpp":
+            for csv_file in csvs:
+                filter_csv_rows(csv_file, filter_paths)
 
         # 5. Build response (single CSV, or a zip if several files matched)
         if len(csvs) == 1:
